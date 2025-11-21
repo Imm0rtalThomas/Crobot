@@ -1,1 +1,879 @@
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+import aiohttp
+import os
+import logging
+import time
+import random
+import asyncio
+import json
+from datetime import datetime
+
+# =========================
+# CONFIG
+# =========================
+
+# PRIMARY guild for faster sync (optional). Use None for global-only.
+PRIMARY_GUILD_ID = 1079478462844248094  # your main server
+GUILD_ID = PRIMARY_GUILD_ID  # used for fast sync; commands are still global too
+
+# Default fallback channel/role IDs (used if per-guild config not set)
+WELCOME_CHANNEL_ID = 1079478463666327553
+MEME_CHANNEL_ID = 1161555548605526088
+TWITCH_LIVE_CHANNEL_ID = 1333677103266398208
+AUTO_ROLE_ID = 1079487575774986330  # Auto-role for new members in your main server
+
+# Leveling and XP settings
+LEVEL_EMOJIS = {
+    10: "⭐", 20: "🌙", 30: "🔥", 40: "💎",
+    50: "⚔️", 60: "👑", 70: "🏆", 80: "🕹️",
+    90: "💥", 100: "💫"
+}
+MAX_LEVEL = 100
+
+# Trivia questions
+TRIVIA_QUESTIONS = [
+    {"q": "What year was the original Call of Duty released?", "a": "2003"},
+    {"q": "Which game features a character named 'Link'?", "a": "zelda"},
+    {"q": "What is Minecraft’s primary building block?", "a": "stone"},
+    {"q": "In which game do players compete in a battle royale on an island?", "a": "fortnite"},
+    {"q": "Which console is made by Sony?", "a": "playstation"},
+]
+
+# Meme posting interval (2 hours)
+MEME_POST_INTERVAL = 7200
+
+# Data directory
+DATA_DIR = "data"
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+TWITCH_FILE = os.path.join(DATA_DIR, "twitch_links.json")
+GUILD_FILE = os.path.join(DATA_DIR, "guild_config.json")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s:%(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("CROBOT")
+
+
+# =========================
+# BOT & INTENTS
+# =========================
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+
+# =========================
+# LOAD / SAVE HELPERS
+# =========================
+
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save {path}: {e}")
+
+
+def save_all():
+    save_json(USERS_FILE, user_data)
+    save_json(TWITCH_FILE, twitch_links)
+    save_json(GUILD_FILE, guild_config)
+    logger.info("Data saved to disk.")
+
+
+# =========================
+# DATA STORES (persistent)
+# =========================
+
+user_data = load_json(USERS_FILE, {})        # {user_id: {"xp": int, "level": int, "prestige": int}}
+twitch_links = load_json(TWITCH_FILE, {})    # {discord_id: twitch_username}
+guild_config = load_json(GUILD_FILE, {})     # {guild_id: {...}}
+twitch_live_status = {}                      # {twitch_username: bool}
+findplayers_sessions = {}                    # {message_id: {"game": str, "author": Member, "confirmed": set[int]}}
+
+
+# =========================
+# TOKENS / ENV VARS
+# =========================
+
+TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
+TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
+TWITCH_ENABLED = bool(TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET)
+
+if not TWITCH_ENABLED:
+    logger.warning("TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET not set. Twitch features will be disabled.")
+
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+if not DISCORD_BOT_TOKEN:
+    logger.error("Missing DISCORD_BOT_TOKEN in environment variables.")
+    raise SystemExit("Set DISCORD_BOT_TOKEN before running CROBOT.")
+
+# Twitch OAuth caching
+twitch_oauth_token = None
+twitch_oauth_expiry = 0  # unix time
+
+
+# =========================
+# LEVELING HELPERS
+# =========================
+
+def get_level_xp(level: int) -> int:
+    return 100 * level
+
+
+def get_user_record(user_id: int):
+    return user_data.setdefault(str(user_id), {"xp": 0, "level": 1, "prestige": 0})
+
+
+def add_xp(user_id: int, amount: int):
+    data = get_user_record(user_id)
+    data["xp"] += amount
+    leveled_up = False
+    while data["xp"] >= get_level_xp(data["level"]) and data["level"] < MAX_LEVEL:
+        data["xp"] -= get_level_xp(data["level"])
+        data["level"] += 1
+        leveled_up = True
+    return leveled_up, data["level"]
+
+
+def add_prestige(user_id: int):
+    data = get_user_record(user_id)
+    data["prestige"] += 1
+    data["xp"] = 0
+    data["level"] = 1
+
+
+def get_emoji_for_level(level: int) -> str:
+    emoji = ""
+    for lvl in sorted(LEVEL_EMOJIS):
+        if level >= lvl:
+            emoji = LEVEL_EMOJIS[lvl]
+    return emoji
+
+
+# =========================
+# GUILD CONFIG HELPERS
+# =========================
+
+DEFAULT_GUILD_CONFIG = {
+    "welcome_channel_id": None,   # falls back to WELCOME_CHANNEL_ID
+    "meme_channel_id": None,      # falls back to MEME_CHANNEL_ID
+    "twitch_channel_id": None,    # falls back to TWITCH_LIVE_CHANNEL_ID
+    "auto_role_id": None,         # falls back to AUTO_ROLE_ID
+    "banner_style": "clean",      # reserved for future banner styles
+}
+
+
+def get_guild_config(guild: discord.Guild):
+    gid = str(guild.id)
+    cfg = guild_config.get(gid, {}).copy()
+    for k, v in DEFAULT_GUILD_CONFIG.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+
+def set_guild_value(guild: discord.Guild, key: str, value):
+    gid = str(guild.id)
+    cfg = guild_config.get(gid, {})
+    cfg[key] = value
+    guild_config[gid] = cfg
+    save_json(GUILD_FILE, guild_config)
+    logger.info(f"Updated config for guild {gid}: {key}={value}")
+
+
+# =========================
+# TWITCH HELPERS
+# =========================
+
+async def get_twitch_oauth_token():
+    """Get or refresh Twitch OAuth token. Uses simple in-memory cache."""
+    global twitch_oauth_token, twitch_oauth_expiry
+
+    if not TWITCH_ENABLED:
+        return None
+
+    if twitch_oauth_token and time.time() < twitch_oauth_expiry:
+        return twitch_oauth_token
+
+    url = (
+        "https://id.twitch.tv/oauth2/token"
+        f"?client_id={TWITCH_CLIENT_ID}&client_secret={TWITCH_CLIENT_SECRET}"
+        "&grant_type=client_credentials"
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url) as resp:
+            data = await resp.json()
+            twitch_oauth_token = data.get("access_token")
+            if not twitch_oauth_token:
+                logger.error(f"Failed to fetch Twitch OAuth token: {data}")
+                return None
+            expires_in = data.get("expires_in", 3600)
+            twitch_oauth_expiry = time.time() + expires_in - 60
+            logger.info("Fetched new Twitch OAuth token")
+            return twitch_oauth_token
+
+
+async def twitch_check_live(username: str) -> bool:
+    """Return True if the Twitch user is live."""
+    if not TWITCH_ENABLED:
+        return False
+
+    token = await get_twitch_oauth_token()
+    if not token:
+        return False
+
+    headers = {
+        "Client-ID": TWITCH_CLIENT_ID,
+        "Authorization": f"Bearer {token}"
+    }
+    url = f"https://api.twitch.tv/helix/streams?user_login={username}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logger.warning(f"Twitch API returned status {resp.status} for user {username}")
+                return False
+            data = await resp.json()
+            return len(data.get("data", [])) > 0
+
+
+# =========================
+# BACKGROUND TASKS (TWITCH, MEMES, HEARTBEAT, AUTOSAVE)
+# =========================
+
+@tasks.loop(seconds=30)
+async def twitch_live_loop():
+    """Check Twitch live status for linked users."""
+    if not TWITCH_ENABLED:
+        return  # Twitch disabled
+
+    if not twitch_links:
+        logger.info("No Twitch users linked, skipping live check.")
+        return
+
+    logger.info("Checking Twitch live statuses...")
+
+    for discord_id, twitch_username in twitch_links.items():
+        try:
+            is_live = await twitch_check_live(twitch_username)
+        except Exception as e:
+            logger.error(f"Error checking live status for {twitch_username}: {e}")
+            continue
+
+        prev_status = twitch_live_status.get(twitch_username, False)
+
+        if is_live and not prev_status:
+            twitch_live_status[twitch_username] = True
+            # Announce in each guild where this user exists and has a configured twitch channel
+            for guild in bot.guilds:
+                member = guild.get_member(int(discord_id))
+                if not member:
+                    continue
+                cfg = get_guild_config(guild)
+                channel_id = cfg.get("twitch_channel_id") or TWITCH_LIVE_CHANNEL_ID
+                channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
+                if channel:
+                    await channel.send(
+                        f"@everyone 🔥 {member.mention} is now **LIVE** on Twitch!\n"
+                        f"https://twitch.tv/{twitch_username}"
+                    )
+                    logger.info(f"Announced live: {twitch_username} in guild {guild.id}")
+        elif not is_live and prev_status:
+            twitch_live_status[twitch_username] = False
+            logger.info(f"{twitch_username} went offline.")
+
+    logger.info("Finished Twitch live status check.")
+
+
+@tasks.loop(seconds=MEME_POST_INTERVAL)
+async def meme_posting_loop():
+    """Post memes to configured meme channels every X seconds."""
+    meme = await fetch_random_meme()
+    if not meme:
+        logger.warning("Failed to fetch a meme.")
+        return
+
+    personality_msgs = [
+        "CROBOT found a banger meme 🔥",
+        "Check this out, kings 👑",
+        "Here's a gem for you all!",
+        "Time for some laughs 😂",
+        "Fresh meme, just for you!"
+    ]
+    personality = random.choice(personality_msgs)
+
+    for guild in bot.guilds:
+        cfg = get_guild_config(guild)
+        channel_id = cfg.get("meme_channel_id") or MEME_CHANNEL_ID
+        channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
+        if not channel:
+            continue
+        embed = discord.Embed(
+            title=meme['title'],
+            url=meme['post_link'],
+            color=discord.Color.blue()
+        )
+        embed.set_image(url=meme['image_url'])
+        embed.set_footer(text=f"From r/{meme['subreddit']} by u/{meme['author']}")
+        try:
+            await channel.send(content=personality, embed=embed)
+            logger.info(f"Posted a meme in guild {guild.id}: {meme['title']}")
+        except Exception as e:
+            logger.warning(f"Failed to send meme in guild {guild.id}: {e}")
+
+
+async def fetch_random_meme():
+    url = "https://www.reddit.com/r/gaming+memes+funny/top/.json?limit=50&t=week"
+    headers = {'User-Agent': 'CrobotBot/1.0'}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.error(f"Reddit API returned {resp.status}")
+                    return None
+                data = await resp.json()
+                posts = data['data']['children']
+                images = [p['data'] for p in posts if p['data'].get('post_hint') == 'image']
+                if not images:
+                    return None
+                meme = random.choice(images)
+                return {
+                    "title": meme.get('title', 'No Title'),
+                    "image_url": meme.get('url_overridden_by_dest'),
+                    "subreddit": meme.get('subreddit'),
+                    "author": meme.get('author'),
+                    "post_link": f"https://reddit.com{meme.get('permalink')}"
+                }
+        except Exception as e:
+            logger.error(f"Error fetching meme: {e}")
+            return None
+
+
+@tasks.loop(minutes=5)
+async def heartbeat_loop():
+    """Simple keep-alive heartbeat so you can see CROBOT is still running."""
+    logger.info("Heartbeat: CROBOT is alive and running.")
+
+
+@tasks.loop(minutes=2)
+async def autosave_loop():
+    """Periodically save data to disk."""
+    save_all()
+
+
+# =========================
+# EVENTS
+# =========================
+
+WELCOME_TEXTS = [
+    "You're officially part of the crew now. Make yourself at home and say hi 👋",
+    "Glad you pulled up! Check the channels, link with the homies, and have fun 😈",
+    "Welcome in! Grab a seat, squad up, and enjoy the chaos 💥",
+    "Happy to have you here. Dive into the chat and meet the fam 💬",
+]
+
+
+@bot.event
+async def on_ready():
+    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    # Set bot activity status
+    await bot.change_presence(activity=discord.Game(name="Developed by IMM0RTAL"))
+
+    # Sync slash commands (hybrid: primary guild + global)
+    try:
+        if GUILD_ID:
+            guild_obj = discord.Object(id=GUILD_ID)
+            await tree.sync(guild=guild_obj)
+            logger.info(f"Synced commands to primary guild {GUILD_ID}.")
+        # Global sync (may take up to 1 hour to appear)
+        await tree.sync()
+        logger.info("Synced GLOBAL commands.")
+    except Exception as e:
+        logger.error(f"Error syncing commands: {e}")
+
+    # Start background loops (only if not running)
+    if not twitch_live_loop.is_running():
+        twitch_live_loop.start()
+    if not meme_posting_loop.is_running():
+        meme_posting_loop.start()
+    if not heartbeat_loop.is_running():
+        heartbeat_loop.start()
+    if not autosave_loop.is_running():
+        autosave_loop.start()
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    cfg = get_guild_config(member.guild)
+
+    # Auto-role
+    role_id = cfg.get("auto_role_id") or AUTO_ROLE_ID
+    if role_id:
+        try:
+            role = member.guild.get_role(role_id)
+            if role:
+                await member.add_roles(role, reason="Auto-role for new member")
+                logger.info(f"Gave auto-role '{role.name}' to {member} in guild {member.guild.id}")
+        except Exception as e:
+            logger.error(f"Failed to assign auto-role to {member}: {e}")
+
+    # Welcome embed
+    welcome_channel_id = cfg.get("welcome_channel_id") or WELCOME_CHANNEL_ID
+    channel = member.guild.get_channel(welcome_channel_id) or bot.get_channel(welcome_channel_id)
+    if channel:
+        avatar_url = member.avatar.url if member.avatar else member.display_avatar.url
+        text = random.choice(WELCOME_TEXTS)
+        embed = discord.Embed(
+            title=f"🎉 Welcome to {member.guild.name}, {member.display_name}! 🎉",
+            description=text,
+            color=discord.Color.green()
+        )
+        embed.set_thumbnail(url=avatar_url)
+        embed.set_footer(text=f"Member #{member.guild.member_count}")
+        await channel.send(embed=embed)
+        logger.info(f"Welcomed new member {member} in guild {member.guild.id}")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    # XP from text messages
+    leveled_up, new_level = add_xp(message.author.id, 5)
+    if leveled_up:
+        emoji = get_emoji_for_level(new_level)
+        try:
+            await message.channel.send(
+                f"🎉 {message.author.mention} leveled up to **Level {new_level}**! {emoji}",
+                delete_after=15
+            )
+            logger.info(f"{message.author} leveled up to {new_level}")
+        except Exception as e:
+            logger.warning(f"Failed to send level up message: {e}")
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+    if user.bot:
+        return
+    msg_id = reaction.message.id
+    if reaction.emoji == "✅" and msg_id in findplayers_sessions:
+        session = findplayers_sessions[msg_id]
+        if user.id not in session["confirmed"]:
+            session["confirmed"].add(user.id)
+            count = len(session["confirmed"])
+            if reaction.message.embeds:
+                embed = reaction.message.embeds[0]
+                embed.description = (
+                    f"{session['author'].mention} wants to play **{session['game']}**!\n"
+                    f"React with ✅ to join!\n\nConfirmations: {count}"
+                )
+                try:
+                    await reaction.message.edit(embed=embed)
+                    logger.info(f"User {user} joined findplayers session {msg_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to update findplayers embed: {e}")
+
+
+# =========================
+# ADMIN PANEL VIEW
+# =========================
+
+class AdminPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Server Stats", style=discord.ButtonStyle.blurple)
+    async def server_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        online_members = len([m for m in guild.members if m.status != discord.Status.offline])
+        total_xp = sum(u.get("xp", 0) for u in user_data.values())
+        twitch_count = len(twitch_links)
+
+        embed = discord.Embed(
+            title="📊 Server Health Dashboard",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Members", value=len(guild.members))
+        embed.add_field(name="Online", value=online_members)
+        embed.add_field(name="Twitch Linked", value=twitch_count)
+        embed.add_field(name="Total XP Tracked", value=total_xp)
+        embed.set_footer(text=f"Guild ID: {guild.id}")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Reset All Levels", style=discord.ButtonStyle.danger)
+    async def reset_levels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+
+        user_data.clear()
+        save_all()
+        await interaction.response.send_message("⚠️ All XP & Levels have been reset!", ephemeral=True)
+
+    @discord.ui.button(label="Force Save", style=discord.ButtonStyle.gray)
+    async def force_save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+        save_all()
+        await interaction.response.send_message("💾 Data force-saved to disk.", ephemeral=True)
+
+
+# =========================
+# SLASH COMMANDS – GENERAL / TWITCH / LEVEL
+# =========================
+
+@tree.command(name="ping", description="Check CROBOT's response time")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        f"🏰 Pong! Latency: {round(bot.latency * 1000)}ms",
+        ephemeral=True
+    )
+
+
+@tree.command(name="addtwitch", description="Link your Twitch account to CROBOT")
+@app_commands.describe(twitch_username="Your Twitch username")
+async def addtwitch(interaction: discord.Interaction, twitch_username: str):
+    if not TWITCH_ENABLED:
+        await interaction.response.send_message(
+            "❌ Twitch integration is not configured. Ask an admin to set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET.",
+            ephemeral=True
+        )
+        return
+
+    twitch_links[str(interaction.user.id)] = twitch_username.lower()
+    save_json(TWITCH_FILE, twitch_links)
+    await interaction.response.send_message(
+        f"✅ Twitch username `{twitch_username}` linked to your account!",
+        ephemeral=True
+    )
+    logger.info(f"User {interaction.user} linked Twitch username {twitch_username}")
+
+
+@tree.command(name="mytwitch", description="Show your linked Twitch username")
+async def mytwitch(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    twitch_username = twitch_links.get(user_id)
+    if twitch_username:
+        embed = discord.Embed(
+            title=f"{interaction.user.display_name}'s Linked Twitch",
+            description=f"🎮 Your linked Twitch username is:\n**{twitch_username}**",
+            color=discord.Color.purple()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "❌ You haven't linked a Twitch username yet. Use `/addtwitch` to link one!",
+            ephemeral=True
+        )
+
+
+@tree.command(name="prestige", description="Reset your level and start prestige")
+@app_commands.describe(confirm="Set to true to confirm prestige")
+async def prestige(interaction: discord.Interaction, confirm: bool = False):
+    user_id = str(interaction.user.id)
+    data = user_data.get(user_id)
+    if not data or data.get("level", 1) < MAX_LEVEL:
+        await interaction.response.send_message(
+            "❌ You need to be at max level (100) to prestige.",
+            ephemeral=True
+        )
+        return
+
+    if not confirm:
+        await interaction.response.send_message(
+            "⚠️ This will reset your level and XP but give you a prestige point.\n"
+            "Run `/prestige confirm:true` to confirm.",
+            ephemeral=True
+        )
+        return
+
+    add_prestige(interaction.user.id)
+    save_json(USERS_FILE, user_data)
+    await interaction.response.send_message(
+        f"🎉 {interaction.user.mention} has **prestiged**! Your level and XP have been reset.",
+        ephemeral=True
+    )
+    logger.info(f"User {interaction.user} prestiged.")
+
+
+@tree.command(name="resetuserdata", description="Reset XP and level for a user (admin only)")
+@app_commands.describe(member="Member to reset")
+async def resetuserdata(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+    user_data.pop(str(member.id), None)
+    save_json(USERS_FILE, user_data)
+    await interaction.response.send_message(
+        f"✅ Reset XP and level data for {member.display_name}.",
+        ephemeral=True
+    )
+    logger.info(f"Admin {interaction.user} reset data for {member}")
+
+
+@tree.command(name="rank", description="Show your current level and prestige")
+async def rank(interaction: discord.Interaction):
+    data = user_data.get(str(interaction.user.id), {"xp": 0, "level": 1, "prestige": 0})
+    emoji = get_emoji_for_level(data["level"])
+    embed = discord.Embed(
+        title=f"{interaction.user.display_name}'s Rank",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Level", value=f"{data['level']} {emoji}")
+    embed.add_field(name="XP", value=f"{data['xp']} / {get_level_xp(data['level'])}")
+    embed.add_field(name="Prestige", value=str(data["prestige"]))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="leaderboard", description="Show top 10 ranked members")
+async def leaderboard(interaction: discord.Interaction):
+    sorted_users = sorted(
+        user_data.items(),
+        key=lambda x: (x[1].get("prestige", 0), x[1].get("level", 0), x[1].get("xp", 0)),
+        reverse=True
+    )
+    embed = discord.Embed(title="🏆 Top 10 Players", color=discord.Color.purple())
+    count = 0
+    for user_id, data in sorted_users:
+        if count >= 10:
+            break
+        member = interaction.guild.get_member(int(user_id))
+        if member:
+            emoji = get_emoji_for_level(data["level"])
+            embed.add_field(
+                name=f"{count+1}. {member.display_name}",
+                value=f"Level {data['level']} {emoji} | Prestige {data['prestige']}",
+                inline=False
+            )
+            count += 1
+    if count == 0:
+        embed.description = "No data available."
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="admin", description="Open CROBOT admin controls")
+async def admin(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only!", ephemeral=True)
+
+    embed = discord.Embed(
+        title="🛠 CROBOT Admin Control Panel",
+        description="Use the buttons below to view stats, reset levels, or force-save data.",
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=embed, view=AdminPanel(), ephemeral=True)
+
+
+# =========================
+# ADMIN CONFIG COMMANDS (per-server channels & roles)
+# =========================
+
+@tree.command(name="setwelcome", description="Set this server's welcome channel (admin only)")
+@app_commands.describe(channel="Channel to send welcome messages in")
+async def setwelcome(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    set_guild_value(interaction.guild, "welcome_channel_id", channel.id)
+    await interaction.response.send_message(
+        f"✅ Welcome channel set to {channel.mention} for this server.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="setmemes", description="Set this server's meme channel (admin only)")
+@app_commands.describe(channel="Channel to auto-post memes in")
+async def setmemes(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    set_guild_value(interaction.guild, "meme_channel_id", channel.id)
+    await interaction.response.send_message(
+        f"✅ Meme channel set to {channel.mention} for this server.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="settwitch", description="Set this server's Twitch announcement channel (admin only)")
+@app_commands.describe(channel="Channel to announce Twitch go-lives in")
+async def settwitch(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    set_guild_value(interaction.guild, "twitch_channel_id", channel.id)
+    await interaction.response.send_message(
+        f"✅ Twitch live announcements will go to {channel.mention} for this server.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="setautorole", description="Set this server's auto-role for new members (admin only)")
+@app_commands.describe(role="Role to give to new members automatically")
+async def setautorole(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    set_guild_value(interaction.guild, "auto_role_id", role.id)
+    await interaction.response.send_message(
+        f"✅ Auto-role set to {role.mention} for new members in this server.",
+        ephemeral=True
+    )
+
+
+# =========================
+# SLASH COMMANDS – FINDPLAYERS & MINIGAMES & FUN
+# =========================
+
+@tree.command(name="findplayers", description="Find and gather players for a game")
+@app_commands.describe(game="Name of the game")
+async def findplayers(interaction: discord.Interaction, game: str):
+    embed = discord.Embed(
+        title=f"Looking for players for **{game}**!",
+        description=f"{interaction.user.mention} wants to play **{game}**!\n"
+                    f"React with ✅ to join!\n\nConfirmations: 0",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow()
+    )
+    msg = await interaction.channel.send(embed=embed)
+    await msg.add_reaction("✅")
+
+    findplayers_sessions[msg.id] = {
+        "game": game,
+        "author": interaction.user,
+        "confirmed": set()
+    }
+
+    async def auto_delete():
+        await asyncio.sleep(90 * 60)  # 1 hour 30 minutes
+        try:
+            await msg.delete()
+            findplayers_sessions.pop(msg.id, None)
+            logger.info(f"Deleted findplayers session message {msg.id}")
+        except Exception:
+            pass
+
+    bot.loop.create_task(auto_delete())
+    await interaction.response.send_message(
+        f"✅ Game session created for **{game}**!",
+        ephemeral=True
+    )
+
+
+@tree.command(name="coinflip", description="Flip a coin, win XP if you guess right!")
+@app_commands.describe(guess="Heads or tails?")
+async def coinflip(interaction: discord.Interaction, guess: str):
+    guess = guess.lower()
+    if guess not in ["heads", "tails"]:
+        await interaction.response.send_message(
+            "❌ Please guess `heads` or `tails`.",
+            ephemeral=True
+        )
+        return
+    result = random.choice(["heads", "tails"])
+    if guess == result:
+        leveled_up, new_level = add_xp(interaction.user.id, 10)
+        save_json(USERS_FILE, user_data)
+        msg = f"🎉 You guessed correctly! It was **{result}**. You earned 10 XP!"
+        if leveled_up:
+            emoji = get_emoji_for_level(new_level)
+            msg += f" You leveled up to **Level {new_level}**! {emoji}"
+    else:
+        msg = f"❌ Sorry, it was **{result}**. Better luck next time!"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@tree.command(name="trivia", description="Answer a trivia question and earn XP!")
+async def trivia(interaction: discord.Interaction):
+    question = random.choice(TRIVIA_QUESTIONS)
+
+    # Public question in the channel
+    await interaction.response.send_message(
+        f"❓ **Trivia time!**\n**Question for {interaction.user.mention}:** {question['q']}\n"
+        f"Type your answer in this channel within **30 seconds**!"
+    )
+
+    def check(m: discord.Message):
+        return m.author == interaction.user and m.channel == interaction.channel
+
+    try:
+        msg = await bot.wait_for("message", timeout=30.0, check=check)
+    except asyncio.TimeoutError:
+        await interaction.channel.send(f"⏰ {interaction.user.mention} Time's up! No answer received.")
+        return
+
+    if question['a'].lower() in msg.content.lower():
+        leveled_up, new_level = add_xp(interaction.user.id, 15)
+        save_json(USERS_FILE, user_data)
+        reply = f"🎉 {interaction.user.mention} Correct! You earned **15 XP**."
+        if leveled_up:
+            emoji = get_emoji_for_level(new_level)
+            reply += f" You leveled up to **Level {new_level}**! {emoji}"
+    else:
+        reply = (
+            f"❌ {interaction.user.mention} Incorrect! "
+            f"The right answer was **{question['a']}**."
+        )
+
+    await interaction.channel.send(reply)
+
+
+@tree.command(name="meme", description="CROBOT fetches a meme for you!")
+async def meme(interaction: discord.Interaction):
+    meme_data = await fetch_random_meme()
+    if not meme_data:
+        await interaction.response.send_message("❌ Failed to fetch meme.")
+        return
+
+    embed = discord.Embed(
+        title=meme_data["title"],
+        url=meme_data["post_link"],
+        color=discord.Color.random()
+    )
+    embed.set_image(url=meme_data["image_url"])
+    embed.set_footer(text=f"From r/{meme_data['subreddit']} by u/{meme_data['author']}")
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="love", description="Spread love and positivity in the server 💖")
+async def love(interaction: discord.Interaction):
+    messages = [
+        "💖 You are loved, valued, and welcome here.",
+        "🌟 This server wouldn't be the same without you.",
+        "🔥 You're important, you're seen, and we're glad you're here.",
+        "👑 You matter — and we're grateful you’re part of Crooks & Castles!",
+        "🌙 Even on hard days, you’re never alone. We appreciate you!"
+    ]
+    msg = random.choice(messages)
+    await interaction.response.send_message(f"{interaction.user.mention} {msg}")
+
+
+# =========================
+# RUN THE BOT
+# =========================
+
+if __name__ == "__main__":
+    bot.run(DISCORD_BOT_TOKEN)
 
