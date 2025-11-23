@@ -1146,6 +1146,7 @@ async def askcrobot(interaction: discord.Interaction, *, question: str):
 
 
 
+@tree.command(name="love", description="Spread love and positivity in the server 💖")
 async def love(interaction: discord.Interaction):
     messages = [
         "💖 You are loved, valued, and welcome here.",
