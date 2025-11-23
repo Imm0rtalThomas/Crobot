@@ -345,13 +345,15 @@ async def twitch_live_loop():
                     continue
                 cfg = get_guild_config(guild)
                 channel_id = cfg.get("twitch_channel_id") or TWITCH_LIVE_CHANNEL_ID
-                channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
-                if channel:
-                    await channel.send(
-                        f"@everyone 🔥 {member.mention} is now **LIVE** on Twitch!\n"
-                        f"https://twitch.tv/{twitch_username}"
-                    )
-                    logger.info(f"Announced live: {twitch_username} in guild {guild.id}")
+                channel = guild.get_channel(channel_id)
+                if not channel:
+                    # No valid Twitch channel in this guild; skip to the next guild
+                    continue
+                await channel.send(
+                    f"@everyone 🔥 {member.mention} is now **LIVE** on Twitch!\n"
+                    f"https://twitch.tv/{twitch_username}"
+                )
+                logger.info(f"Announced live: {twitch_username} in guild {guild.id}")
         elif not is_live and prev_status:
             twitch_live_status[twitch_username] = False
             logger.info(f"{twitch_username} went offline.")
@@ -379,8 +381,9 @@ async def meme_posting_loop():
     for guild in bot.guilds:
         cfg = get_guild_config(guild)
         channel_id = cfg.get("meme_channel_id") or MEME_CHANNEL_ID
-        channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
+        channel = guild.get_channel(channel_id)
         if not channel:
+            # No meme channel configured for this guild
             continue
         embed = discord.Embed(
             title=meme['title'],
@@ -549,15 +552,17 @@ async def on_member_join(member: discord.Member):
 
     # Welcome embed
     welcome_channel_id = cfg.get("welcome_channel_id") or WELCOME_CHANNEL_ID
-    channel = member.guild.get_channel(welcome_channel_id) or bot.get_channel(welcome_channel_id)
-    if channel:
-        avatar_url = member.avatar.url if member.avatar else member.display_avatar.url
-        text = random.choice(WELCOME_TEXTS)
-        embed = discord.Embed(
-            title=f"🎉 Welcome to {member.guild.name}, {member.display_name}! 🎉",
-            description=text,
-            color=discord.Color.green()
-        )
+    channel = member.guild.get_channel(welcome_channel_id)
+    if not channel:
+        # No valid welcome channel configured for this guild
+        return
+    avatar_url = member.avatar.url if member.avatar else member.display_avatar.url
+    text = random.choice(WELCOME_TEXTS)
+    embed = discord.Embed(
+        title=f"🎉 Welcome to {member.guild.name}, {member.display_name}! 🎉",
+        description=text,
+        color=discord.Color.green()
+    )
         embed.set_thumbnail(url=avatar_url)
         embed.set_footer(text=f"Member #{member.guild.member_count}")
         await channel.send(embed=embed)
@@ -682,17 +687,21 @@ async def ping(interaction: discord.Interaction):
 @tree.command(name="addtwitch", description="Link your Twitch account to CROBOT")
 @app_commands.describe(twitch_username="Your Twitch username")
 async def addtwitch(interaction: discord.Interaction, twitch_username: str):
-    if not TWITCH_ENABLED:
-        await interaction.response.send_message(
-            "❌ Twitch integration is not configured. Ask an admin to set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET.",
-            ephemeral=True
-        )
-        return
-
+    # Always save the Twitch username locally, even if live checks are not yet configured
     twitch_links[str(interaction.user.id)] = twitch_username.lower()
     save_json(TWITCH_FILE, twitch_links)
+
+    if TWITCH_ENABLED:
+        message = f"✅ Twitch username `{twitch_username}` linked to your account!"
+    else:
+        message = (
+            f"✅ Saved Twitch username `{twitch_username}` for your account, but Twitch live notifications "
+            "are not fully configured yet. Ask an admin to set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET "
+            "so CROBOT can announce when you go live."
+        )
+
     await interaction.response.send_message(
-        f"✅ Twitch username `{twitch_username}` linked to your account!",
+        message,
         ephemeral=True
     )
     logger.info(f"User {interaction.user} linked Twitch username {twitch_username}")
