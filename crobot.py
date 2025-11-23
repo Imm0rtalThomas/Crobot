@@ -34,6 +34,17 @@ MAX_LEVEL = 100
 
 # Trivia questions
 TRIVIA_QUESTIONS = [
+
+    {"q": "In which game do you hunt massive creatures called Elder Dragons?", "a": "monster hunter"},
+    {"q": "Which game features the city of Los Santos?", "a": "gta v"},
+    {"q": "What color is Sonic the Hedgehog?", "a": "blue"},
+    {"q": "Which Nintendo character is known for saying 'It's-a me!'", "a": "mario"},
+    {"q": "In Apex Legends, how many players are on a standard squad?", "a": "3"},
+    {"q": "Which game popularized the term 'chicken dinner' for winning?", "a": "pubg"},
+    {"q": "What is the name of the cube-shaped world in Minecraft?", "a": "overworld"},
+    {"q": "In Valorant, how many rounds does a team need to win in unrated/competitive?", "a": "13"},
+    {"q": "Which company created the game League of Legends?", "a": "riot"},
+    {"q": "In Fortnite, what is the material that's strongest for building?", "a": "metal"},
     {"q": "What year was the original Call of Duty released?", "a": "2003"},
     {"q": "Which game features a character named 'Link'?", "a": "zelda"},
     {"q": "What is Minecraft’s primary building block?", "a": "stone"},
@@ -49,6 +60,7 @@ DATA_DIR = "data"
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 TWITCH_FILE = os.path.join(DATA_DIR, "twitch_links.json")
 GUILD_FILE = os.path.join(DATA_DIR, "guild_config.json")
+BIRTHDAYS_FILE = os.path.join(DATA_DIR, "birthdays.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -108,7 +120,11 @@ user_data = load_json(USERS_FILE, {})        # {user_id: {"xp": int, "level": in
 twitch_links = load_json(TWITCH_FILE, {})    # {discord_id: twitch_username}
 guild_config = load_json(GUILD_FILE, {})     # {guild_id: {...}}
 twitch_live_status = {}                      # {twitch_username: bool}
-findplayers_sessions = {}                    # {message_id: {"game": str, "author": Member, "confirmed": set[int]}}
+birthdays = load_json(BIRTHDAYS_FILE, {})   # {user_id: "YYYY-MM-DD"}
+
+# Prevent double-starting the meme loop
+meme_loop_started = False
+
 
 
 # =========================
@@ -180,6 +196,7 @@ DEFAULT_GUILD_CONFIG = {
     "twitch_channel_id": None,    # falls back to TWITCH_LIVE_CHANNEL_ID
     "auto_role_id": None,         # falls back to AUTO_ROLE_ID
     "banner_style": "clean",      # reserved for future banner styles
+    "welcome_dm_message": None,  # optional DM welcome template
 }
 
 
@@ -199,6 +216,43 @@ def set_guild_value(guild: discord.Guild, key: str, value):
     save_json(GUILD_FILE, guild_config)
     logger.info(f"Updated config for guild {gid}: {key}={value}")
 
+def get_bad_words(guild: discord.Guild):
+    cfg = get_guild_config(guild)
+    words = cfg.get("bad_words", [])
+    if not isinstance(words, list):
+        words = []
+    # normalize to lowercase
+    return [w.lower() for w in words]
+
+
+def add_bad_word(guild: discord.Guild, word: str):
+    gid = str(guild.id)
+    cfg = guild_config.get(gid, {})
+    words = cfg.get("bad_words", [])
+    if not isinstance(words, list):
+        words = []
+    word = word.lower().strip()
+    if word and word not in words:
+        words.append(word)
+    cfg["bad_words"] = words
+    guild_config[gid] = cfg
+    save_json(GUILD_FILE, guild_config)
+    logger.info(f"Added bad word '{word}' for guild {gid}")
+
+
+def remove_bad_word(guild: discord.Guild, word: str):
+    gid = str(guild.id)
+    cfg = guild_config.get(gid, {})
+    words = cfg.get("bad_words", [])
+    if not isinstance(words, list):
+        words = []
+    word = word.lower().strip()
+    if word in words:
+        words.remove(word)
+    cfg["bad_words"] = words
+    guild_config[gid] = cfg
+    save_json(GUILD_FILE, guild_config)
+    logger.info(f"Removed bad word '{word}' for guild {gid}")
 
 # =========================
 # TWITCH HELPERS
@@ -381,6 +435,39 @@ async def autosave_loop():
     save_all()
 
 
+@tasks.loop(hours=24)
+async def birthday_loop():
+    """Check and announce birthdays once a day."""
+    if not bot.guilds:
+        return
+    today = datetime.utcnow().strftime("%m-%d")
+    logger.info("Running daily birthday check...")
+    for guild in bot.guilds:
+        cfg = get_guild_config(guild)
+        channel_id = cfg.get("welcome_channel_id") or WELCOME_CHANNEL_ID
+        channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
+        if not channel:
+            continue
+        for member in guild.members:
+            uid = str(member.id)
+            bday = birthdays.get(uid)
+            if not bday:
+                continue
+            # stored as YYYY-MM-DD
+            try:
+                _, month, day = bday.split("-")
+                if f"{month}-{day}" == today:
+                    try:
+                        await channel.send(
+                            f"🎂 Happy birthday {member.mention}! Wishing you an amazing day! 🎉"
+                        )
+                        logger.info(f"Wished happy birthday to {member} in guild {guild.id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to send birthday message for {member}: {e}")
+            except Exception:
+                continue
+
+
 # =========================
 # EVENTS
 # =========================
@@ -413,19 +500,41 @@ async def on_ready():
         logger.error(f"Error syncing commands: {e}")
 
     # Start background loops (only if not running)
+    global meme_loop_started
+
     if not twitch_live_loop.is_running():
         twitch_live_loop.start()
-    if not meme_posting_loop.is_running():
-        meme_posting_loop.start()
+
+    if not meme_loop_started and not meme_posting_loop.is_running():
+        try:
+            meme_posting_loop.start()
+            meme_loop_started = True
+            logger.info("meme_posting_loop started.")
+        except RuntimeError:
+            logger.warning("meme_posting_loop already running; skipped.")
+
     if not heartbeat_loop.is_running():
         heartbeat_loop.start()
+
     if not autosave_loop.is_running():
         autosave_loop.start()
+
+    if not birthday_loop.is_running():
+        birthday_loop.start()
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
     cfg = get_guild_config(member.guild)
+
+    # Welcome DM
+    dm_template = cfg.get("welcome_dm_message")
+    if dm_template:
+        try:
+            dm_text = dm_template.replace("{user}", member.mention).replace("{server}", member.guild.name)
+            await member.send(dm_text)
+        except Exception as e:
+            logger.warning(f"Failed to send welcome DM to {member}: {e}")
 
     # Auto-role
     role_id = cfg.get("auto_role_id") or AUTO_ROLE_ID
@@ -459,6 +568,23 @@ async def on_member_join(member: discord.Member):
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    # Auto-mod: simple bad word filter
+    if message.guild:
+        bad_words = get_bad_words(message.guild)
+        if bad_words:
+            content_lower = message.content.lower()
+            if any(bad in content_lower for bad in bad_words):
+                try:
+                    await message.delete()
+                    await message.channel.send(
+                        f"{message.author.mention}, your message was removed for language.",
+                        delete_after=10
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to delete message for automod: {e}")
+                return
+
     # XP from text messages
     leveled_up, new_level = add_xp(message.author.id, 5)
     if leveled_up:
@@ -637,6 +763,42 @@ async def resetuserdata(interaction: discord.Interaction, member: discord.Member
     logger.info(f"Admin {interaction.user} reset data for {member}")
 
 
+
+@tree.command(name="setbirthday", description="Set your birthday (YYYY-MM-DD)")
+@app_commands.describe(date="Your birthday in YYYY-MM-DD format")
+async def setbirthday(interaction: discord.Interaction, date: str):
+    try:
+        # basic validation
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return await interaction.response.send_message(
+            "❌ Invalid date format. Use YYYY-MM-DD.",
+            ephemeral=True
+        )
+    uid = str(interaction.user.id)
+    birthdays[uid] = date
+    save_json(BIRTHDAYS_FILE, birthdays)
+    await interaction.response.send_message(
+        f"✅ Your birthday has been set to **{date}**.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="mybirthday", description="Show your saved birthday")
+async def mybirthday(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    bday = birthdays.get(uid)
+    if not bday:
+        return await interaction.response.send_message(
+            "❌ You have not set a birthday yet. Use /setbirthday.",
+            ephemeral=True
+        )
+    await interaction.response.send_message(
+        f"🎂 Your saved birthday is **{bday}**.",
+        ephemeral=True
+    )
+
+
 @tree.command(name="rank", description="Show your current level and prestige")
 async def rank(interaction: discord.Interaction):
     data = user_data.get(str(interaction.user.id), {"xp": 0, "level": 1, "prestige": 0})
@@ -677,6 +839,16 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+
+@tree.command(name="xp", description="Show your XP stats")
+async def xp_command(interaction: discord.Interaction):
+    data = get_user_record(interaction.user.id)
+    emoji = get_emoji_for_level(data["level"])
+    await interaction.response.send_message(
+        f"XP: **{data['xp']}** | Level: **{data['level']}** {emoji} | Prestige: **{data['prestige']}**",
+        ephemeral=True
+    )
+
 @tree.command(name="admin", description="Open CROBOT admin controls")
 async def admin(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -690,9 +862,46 @@ async def admin(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=AdminPanel(), ephemeral=True)
 
 
+
+@tree.command(name="synccommands", description="Force sync CROBOT slash commands (admin only).")
+async def synccommands(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ You need admin permissions for this.", ephemeral=True
+        )
+
+    try:
+        if GUILD_ID:
+            guild_obj = discord.Object(id=GUILD_ID)
+            await tree.sync(guild=guild_obj)
+
+        await tree.sync()
+
+        await interaction.response.send_message(
+            "✅ Slash commands synced. Global commands may take up to 1 hour to appear.",
+            ephemeral=True
+        )
+        logger.info(f"Slash commands manually synced by {interaction.user}.")
+    except Exception as e:
+        await interaction.response.send_message("❌ Failed to sync commands.", ephemeral=True)
+        logger.error(f"Manual command sync error: {e}")
+
+
 # =========================
 # ADMIN CONFIG COMMANDS (per-server channels & roles)
 # =========================
+
+@tree.command(name="setwelcomedm", description="Set the DM welcome message for this server (admin only)")
+@app_commands.describe(message="Welcome DM text. Use {user} and {server} placeholders.")
+async def setwelcomedm(interaction: discord.Interaction, message: str):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    set_guild_value(interaction.guild, "welcome_dm_message", message)
+    await interaction.response.send_message(
+        "✅ Welcome DM message updated for this server.",
+        ephemeral=True
+    )
+
 
 @tree.command(name="setwelcome", description="Set this server's welcome channel (admin only)")
 @app_commands.describe(channel="Channel to send welcome messages in")
@@ -858,6 +1067,85 @@ async def meme(interaction: discord.Interaction):
 
 
 @tree.command(name="love", description="Spread love and positivity in the server 💖")
+
+@tree.command(name="playradio", description="Play a radio stream in your current voice channel")
+@app_commands.describe(url="Direct audio stream URL (mp3/aac/opus/m3u8)")
+async def playradio(interaction: discord.Interaction, url: str):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        return await interaction.response.send_message(
+            "❌ You must be in a voice channel to use this.",
+            ephemeral=True
+        )
+
+    channel = interaction.user.voice.channel
+
+    # Connect or move to the user's channel
+    vc = interaction.guild.voice_client
+    if vc and vc.is_connected():
+        await vc.move_to(channel)
+    else:
+        vc = await channel.connect()
+
+    try:
+        # NOTE: This requires ffmpeg and voice dependencies to be available in the runtime.
+        source = discord.FFmpegOpusAudio(url)
+        vc.stop()
+        vc.play(source)
+        await interaction.response.send_message(
+            f"🎧 Playing radio stream in {channel.mention}.",
+            ephemeral=True
+        )
+        logger.info(f"Started radio stream in guild {interaction.guild.id}: {url}")
+    except Exception as e:
+        logger.error(f"Failed to play radio: {e}")
+        await interaction.response.send_message(
+            "❌ Failed to start radio. Make sure the URL is a valid audio stream and voice dependencies are installed.",
+            ephemeral=True
+        )
+
+
+@tree.command(name="stopradio", description="Stop radio and disconnect from voice")
+async def stopradio(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        return await interaction.response.send_message(
+            "❌ I'm not in a voice channel.",
+            ephemeral=True
+        )
+
+    try:
+        await vc.disconnect()
+        await interaction.response.send_message("⏹️ Radio stopped and disconnected.", ephemeral=True)
+        logger.info(f"Stopped radio in guild {interaction.guild.id}")
+    except Exception as e:
+        logger.error(f"Failed to disconnect from voice: {e}")
+        await interaction.response.send_message("❌ Failed to disconnect from voice.", ephemeral=True)
+
+
+@tree.command(name="askcrobot", description="Ask CROBOT for advice or an opinion.")
+async def askcrobot(interaction: discord.Interaction, *, question: str):
+    responses = [
+        "Short answer: {summary}. Long answer: you already knew that.",
+        "Honestly? {summary}. Also drink some water.",
+        "My advanced analysis says: {summary}.",
+        "Based on 0% emotion and 100% chaos energy: {summary}.",
+    ]
+
+    lower_q = question.lower()
+    if "stream" in lower_q:
+        summary = "stay consistent and tweak your schedule"
+    elif "discord" in lower_q or "server" in lower_q:
+        summary = "clean channels, clear rules, and fun events grow a server"
+    elif "content" in lower_q or "videos" in lower_q:
+        summary = "improve one thing each video instead of everything at once"
+    else:
+        summary = "do the thing that scares you just a little bit"
+
+    reply = random.choice(responses).format(summary=summary)
+    await interaction.response.send_message(reply, ephemeral=False)
+
+
+
 async def love(interaction: discord.Interaction):
     messages = [
         "💖 You are loved, valued, and welcome here.",
