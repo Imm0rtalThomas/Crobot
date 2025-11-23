@@ -1,3 +1,4 @@
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -563,10 +564,10 @@ async def on_member_join(member: discord.Member):
         description=text,
         color=discord.Color.green()
     )
-        embed.set_thumbnail(url=avatar_url)
-        embed.set_footer(text=f"Member #{member.guild.member_count}")
+    embed.set_thumbnail(url=avatar_url)
+    embed.set_footer(text=f"Member #{member.guild.member_count}")
         await channel.send(embed=embed)
-        logger.info(f"Welcomed new member {member} in guild {member.guild.id}")
+    logger.info(f"Welcomed new member {member} in guild {member.guild.id}")
 
 
 @bot.event
