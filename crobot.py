@@ -1066,7 +1066,6 @@ async def meme(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="love", description="Spread love and positivity in the server 💖")
 
 @tree.command(name="playradio", description="Play a radio stream in your current voice channel")
 @app_commands.describe(url="Direct audio stream URL (mp3/aac/opus/m3u8)")
