@@ -55,12 +55,38 @@ TRIVIA_QUESTIONS = [
 # Meme posting interval (2 hours)
 MEME_POST_INTERVAL = 7200
 
+# Preset radio stations for /playradio
+RADIO_STATIONS = {
+    "lofi": {
+        "name": "Lofi Chill",
+        "url": "https://stream.nightride.fm/lofi.ogg",
+    },
+    "chillhop": {
+        "name": "Chillhop Beats",
+        "url": "https://streams.ilovemusic.de/iloveradio8.mp3",
+    },
+    "phonk": {
+        "name": "Phonk Radio",
+        "url": "https://cast1.asurahosting.com/proxy/phonk?mp=/stream",
+    },
+    "edm": {
+        "name": "EDM Hits",
+        "url": "https://us4.internet-radio.com/proxy/partyviberadio?mp=/stream",
+    },
+    "synthwave": {
+        "name": "Synthwave FM",
+        "url": "https://stream.nightride.fm/chillsynth.ogg",
+    },
+}
+
+
 # Data directory
 DATA_DIR = "data"
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 TWITCH_FILE = os.path.join(DATA_DIR, "twitch_links.json")
 GUILD_FILE = os.path.join(DATA_DIR, "guild_config.json")
 BIRTHDAYS_FILE = os.path.join(DATA_DIR, "birthdays.json")
+WARNINGS_FILE = os.path.join(DATA_DIR, "warnings.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -71,6 +97,30 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("CROBOT")
+
+# =========================
+# STATUS MESSAGES (ROTATING)
+# =========================
+
+STATUS_MESSAGES = [
+    "CROBOT: silently judging your server.",
+    "Crowned skeleton overlord of this wasteland.",
+    "Grinding souls into XP since 2025.",
+    "Haunting your channels for XP.",
+    "Balancing memes, music, and mild threats.",
+    "Running on bugs and bad decisions.",
+    "Listening to your chaos in HD.",
+    "Warming up the ban hammer (just in case).",
+    "Optimizing your server. Disrespectfully.",
+    "Looting your logs for \"analytics.\"",
+    "Pretending to be a normal bot.",
+    "Powered by IMM0RTAL’s insomnia.",
+    "Skeleton king of status messages.",
+    "If I’m online, you should be grinding.",
+]
+
+status_index = 0
+
 
 
 # =========================
@@ -109,6 +159,8 @@ def save_all():
     save_json(USERS_FILE, user_data)
     save_json(TWITCH_FILE, twitch_links)
     save_json(GUILD_FILE, guild_config)
+    save_json(BIRTHDAYS_FILE, birthdays)
+    save_json(WARNINGS_FILE, warnings_data)
     logger.info("Data saved to disk.")
 
 
@@ -196,7 +248,9 @@ DEFAULT_GUILD_CONFIG = {
     "twitch_channel_id": None,    # falls back to TWITCH_LIVE_CHANNEL_ID
     "auto_role_id": None,         # falls back to AUTO_ROLE_ID
     "banner_style": "clean",      # reserved for future banner styles
-    "welcome_dm_message": None,  # optional DM welcome template
+    "welcome_dm_message": None,   # optional DM welcome template
+    "meme_interval": MEME_POST_INTERVAL,  # per-guild meme interval in seconds
+    "mod_role_id": None,          # role to ping on moderation escalation
 }
 
 
@@ -253,6 +307,37 @@ def remove_bad_word(guild: discord.Guild, word: str):
     guild_config[gid] = cfg
     save_json(GUILD_FILE, guild_config)
     logger.info(f"Removed bad word '{word}' for guild {gid}")
+
+# =========================
+# MODERATION / WARNING HELPERS
+# =========================
+
+def get_warning_count(guild_id: int, user_id: int) -> int:
+    gid = str(guild_id)
+    uid = str(user_id)
+    return warnings_data.get(gid, {}).get(uid, 0)
+
+
+def increment_warning(guild_id: int, user_id: int) -> int:
+    gid = str(guild_id)
+    uid = str(user_id)
+    guild_warnings = warnings_data.get(gid, {})
+    current = guild_warnings.get(uid, 0) + 1
+    guild_warnings[uid] = current
+    warnings_data[gid] = guild_warnings
+    save_json(WARNINGS_FILE, warnings_data)
+    return current
+
+
+def reset_warnings(guild_id: int, user_id: int):
+    gid = str(guild_id)
+    uid = str(user_id)
+    guild_warnings = warnings_data.get(gid, {})
+    if uid in guild_warnings:
+        guild_warnings.pop(uid)
+        warnings_data[gid] = guild_warnings
+        save_json(WARNINGS_FILE, warnings_data)
+
 
 # =========================
 # TWITCH HELPERS
@@ -361,13 +446,11 @@ async def twitch_live_loop():
     logger.info("Finished Twitch live status check.")
 
 
-@tasks.loop(seconds=MEME_POST_INTERVAL)
+@tasks.loop(minutes=5)
 async def meme_posting_loop():
-    """Post memes to configured meme channels every X seconds."""
-    meme = await fetch_random_meme()
-    if not meme:
-        logger.warning("Failed to fetch a meme.")
-        return
+    """Post memes to configured meme channels using per-guild intervals."""
+    now = time.time()
+    updated_any = False
 
     personality_msgs = [
         "CROBOT found a banger meme 🔥",
@@ -376,54 +459,52 @@ async def meme_posting_loop():
         "Time for some laughs 😂",
         "Fresh meme, just for you!"
     ]
-    personality = random.choice(personality_msgs)
 
     for guild in bot.guilds:
-        cfg = get_guild_config(guild)
-        channel_id = cfg.get("meme_channel_id") or MEME_CHANNEL_ID
-        channel = guild.get_channel(channel_id)
-        if not channel:
-            # No meme channel configured for this guild
-            continue
-        embed = discord.Embed(
-            title=meme['title'],
-            url=meme['post_link'],
-            color=discord.Color.blue()
-        )
-        embed.set_image(url=meme['image_url'])
-        embed.set_footer(text=f"From r/{meme['subreddit']} by u/{meme['author']}")
         try:
+            cfg = get_guild_config(guild)
+            channel_id = cfg.get("meme_channel_id") or MEME_CHANNEL_ID
+            if not channel_id:
+                continue
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                continue
+
+            interval = cfg.get("meme_interval") or MEME_POST_INTERVAL
+            next_time = cfg.get("next_meme_time", 0)
+
+            if now < next_time:
+                continue
+
+            meme = await fetch_random_meme()
+            if not meme:
+                logger.warning("Failed to fetch a meme.")
+                continue
+
+            personality = random.choice(personality_msgs)
+            embed = discord.Embed(
+                title=meme["title"],
+                url=meme["post_link"],
+                color=discord.Color.blue()
+            )
+            embed.set_image(url=meme["image_url"])
+            embed.set_footer(text=f"From r/{meme['subreddit']} by u/{meme['author']}")
+
             await channel.send(content=personality, embed=embed)
             logger.info(f"Posted a meme in guild {guild.id}: {meme['title']}")
-        except Exception as e:
-            logger.warning(f"Failed to send meme in guild {guild.id}: {e}")
 
-
-async def fetch_random_meme():
-    url = "https://www.reddit.com/r/gaming+memes+funny/top/.json?limit=50&t=week"
-    headers = {'User-Agent': 'CrobotBot/1.0'}
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    logger.error(f"Reddit API returned {resp.status}")
-                    return None
-                data = await resp.json()
-                posts = data['data']['children']
-                images = [p['data'] for p in posts if p['data'].get('post_hint') == 'image']
-                if not images:
-                    return None
-                meme = random.choice(images)
-                return {
-                    "title": meme.get('title', 'No Title'),
-                    "image_url": meme.get('url_overridden_by_dest'),
-                    "subreddit": meme.get('subreddit'),
-                    "author": meme.get('author'),
-                    "post_link": f"https://reddit.com{meme.get('permalink')}"
-                }
+            # update next meme time for this guild
+            gid = str(guild.id)
+            raw_cfg = guild_config.get(gid, {})
+            raw_cfg["next_meme_time"] = now + interval
+            raw_cfg["meme_interval"] = interval
+            guild_config[gid] = raw_cfg
+            updated_any = True
         except Exception as e:
-            logger.error(f"Error fetching meme: {e}")
-            return None
+            logger.warning(f"Failed to send meme in guild {getattr(guild, 'id', '?')}: {e}")
+
+    if updated_any:
+        save_json(GUILD_FILE, guild_config)
 
 
 @tasks.loop(minutes=5)
@@ -434,6 +515,26 @@ async def heartbeat_loop():
 
 @tasks.loop(minutes=2)
 async def autosave_loop():
+    """Periodically save data to disk."""
+    save_all()
+
+
+@tasks.loop(hours=24)
+async def status_rotation_loop():
+    """Rotate CROBOT's status every 24 hours."""
+    global status_index
+    if not bot.is_ready():
+        return
+    if not STATUS_MESSAGES:
+        return
+    status_text = STATUS_MESSAGES[status_index % len(STATUS_MESSAGES)]
+    try:
+        await bot.change_presence(activity=discord.Game(name=status_text))
+        logger.info(f"Status updated to: {status_text}")
+    except Exception as e:
+        logger.warning(f"Failed to update status: {e}")
+    status_index += 1
+
     """Periodically save data to disk."""
     save_all()
 
@@ -487,8 +588,12 @@ WELCOME_TEXTS = [
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-    # Set bot activity status
-    await bot.change_presence(activity=discord.Game(name="Developed by IMM0RTAL"))
+    # Set initial bot activity status and let the rotation loop handle the rest
+    if STATUS_MESSAGES:
+        try:
+            await bot.change_presence(activity=discord.Game(name=STATUS_MESSAGES[0]))
+        except Exception as e:
+            logger.warning(f"Failed to set initial status: {e}")
 
     # Sync slash commands (hybrid: primary guild + global)
     try:
@@ -524,6 +629,9 @@ async def on_ready():
 
     if not birthday_loop.is_running():
         birthday_loop.start()
+
+    if not status_rotation_loop.is_running():
+        status_rotation_loop.start()
 
 
 @bot.event
@@ -574,20 +682,81 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Auto-mod: simple bad word filter
+    # Auto-mod: watchwords + warning system
     if message.guild:
         bad_words = get_bad_words(message.guild)
         if bad_words:
             content_lower = message.content.lower()
-            if any(bad in content_lower for bad in bad_words):
-                try:
-                    await message.delete()
-                    await message.channel.send(
-                        f"{message.author.mention}, your message was removed for language.",
-                        delete_after=10
+            triggered = None
+            for bad in bad_words:
+                if bad and bad in content_lower:
+                    triggered = bad
+                    break
+
+            if triggered:
+                guild = message.guild
+                gid = guild.id
+                uid = message.author.id
+                count = increment_warning(gid, uid)
+
+                # Build warning embed
+                title = f"⚠ Warning {count}/3 for {message.author.display_name}"
+                color = discord.Color.yellow()
+                if count >= 3:
+                    title = f"🚨 Escalation: warning {count} for {message.author.display_name}"
+                    color = discord.Color.red()
+
+                preview = message.content
+                if len(preview) > 200:
+                    preview = preview[:197] + "..."
+
+                embed = discord.Embed(
+                    title=title,
+                    color=color,
+                    timestamp=datetime.utcnow()
+                )
+                embed.add_field(
+                    name="Offender",
+                    value=message.author.mention,
+                    inline=True
+                )
+                embed.add_field(
+                    name="Triggered phrase",
+                    value=f"`{triggered}`",
+                    inline=True
+                )
+                embed.add_field(
+                    name="Channel",
+                    value=message.channel.mention,
+                    inline=False
+                )
+                if preview:
+                    embed.add_field(
+                        name="Message preview",
+                        value=preview,
+                        inline=False
                     )
+                embed.set_footer(text=f"User ID: {message.author.id} | Guild ID: {guild.id}")
+
+                # Escalation ping on 3rd+ warning
+                content = None
+                cfg = get_guild_config(guild)
+                mod_role_id = cfg.get("mod_role_id")
+                if count >= 3:
+                    role_to_ping = None
+                    if mod_role_id:
+                        role_to_ping = guild.get_role(mod_role_id)
+                    if role_to_ping:
+                        content = f"{role_to_ping.mention}"
+                    elif guild.owner:
+                        content = f"{guild.owner.mention}"
+
+                try:
+                    await message.channel.send(content=content, embed=embed)
                 except Exception as e:
-                    logger.warning(f"Failed to delete message for automod: {e}")
+                    logger.warning(f"Failed to send moderation warning: {e}")
+
+                # Do not grant XP on moderated messages
                 return
 
     # XP from text messages
@@ -602,10 +771,9 @@ async def on_message(message: discord.Message):
             logger.info(f"{message.author} leveled up to {new_level}")
         except Exception as e:
             logger.warning(f"Failed to send level up message: {e}")
+
     await bot.process_commands(message)
 
-
-@bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     if user.bot:
         return
@@ -936,6 +1104,45 @@ async def setmemes(interaction: discord.Interaction, channel: discord.TextChanne
     )
 
 
+
+@tree.command(name="setmemeinterval", description="Set how often CROBOT posts memes in this server (admin only)")
+@app_commands.describe(interval="How often memes should be posted")
+@app_commands.choices(interval=[
+    app_commands.Choice(name="Every 2 hours", value="2h"),
+    app_commands.Choice(name="Every 6 hours", value="6h"),
+    app_commands.Choice(name="Every 12 hours", value="12h"),
+    app_commands.Choice(name="Every 48 hours", value="48h"),
+    app_commands.Choice(name="Once a week", value="1w"),
+])
+async def setmemeinterval(interaction: discord.Interaction, interval: app_commands.Choice[str]):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+
+    mapping = {
+        "2h": 2 * 60 * 60,
+        "6h": 6 * 60 * 60,
+        "12h": 12 * 60 * 60,
+        "48h": 48 * 60 * 60,
+        "1w": 7 * 24 * 60 * 60,
+    }
+    seconds = mapping.get(interval.value, MEME_POST_INTERVAL)
+
+    gid = str(interaction.guild.id)
+    raw_cfg = guild_config.get(gid, {})
+    raw_cfg["meme_interval"] = seconds
+    # force next meme to be scheduled from now
+    raw_cfg["next_meme_time"] = 0
+    guild_config[gid] = raw_cfg
+    save_json(GUILD_FILE, guild_config)
+
+    await interaction.response.send_message(
+        f"✅ Meme interval set to **{interval.name}** for this server.",
+        ephemeral=True
+    )
+
+
+
+
 @tree.command(name="settwitch", description="Set this server's Twitch announcement channel (admin only)")
 @app_commands.describe(channel="Channel to announce Twitch go-lives in")
 async def settwitch(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -958,6 +1165,80 @@ async def setautorole(interaction: discord.Interaction, role: discord.Role):
         f"✅ Auto-role set to {role.mention} for new members in this server.",
         ephemeral=True
     )
+
+
+
+
+@tree.command(name="addwatchword", description="Add a word or phrase for CROBOT to watch for (admin only)")
+@app_commands.describe(phrase="Word or phrase to watch for")
+async def addwatchword(interaction: discord.Interaction, phrase: str):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    add_bad_word(interaction.guild, phrase)
+    await interaction.response.send_message(
+        f"✅ Added watch phrase: `{phrase}`",
+        ephemeral=True
+    )
+
+
+@tree.command(name="removewatchword", description="Remove a watched word or phrase (admin only)")
+@app_commands.describe(phrase="Word or phrase to remove")
+async def removewatchword(interaction: discord.Interaction, phrase: str):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    remove_bad_word(interaction.guild, phrase)
+    await interaction.response.send_message(
+        f"✅ Removed watch phrase: `{phrase}` (if it existed).",
+        ephemeral=True
+    )
+
+
+@tree.command(name="listwatchwords", description="List all watched words/phrases for this server")
+async def listwatchwords(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    words = get_bad_words(interaction.guild)
+    if not words:
+        return await interaction.response.send_message(
+            "ℹ No watchwords are configured for this server.",
+            ephemeral=True
+        )
+    embed = discord.Embed(
+        title="👁 Watchwords for this server",
+        description="These words/phrases will trigger warnings:",
+        color=discord.Color.orange()
+    )
+    embed.add_field(
+        name="Watchwords",
+        value=", ".join(f"`{w}`" for w in words),
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="setmodrole", description="Set which role CROBOT pings on moderation escalations (admin only)")
+@app_commands.describe(role="Role to ping when someone hits 3+ warnings")
+async def setmodrole(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    set_guild_value(interaction.guild, "mod_role_id", role.id)
+    await interaction.response.send_message(
+        f"✅ Moderation escalation role set to {role.mention}.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="resetwarnings", description="Reset moderation warnings for a user (admin only)")
+@app_commands.describe(member="Member whose warnings should be cleared")
+async def resetwarnings(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+    reset_warnings(interaction.guild.id, member.id)
+    await interaction.response.send_message(
+        f"✅ Warnings reset for {member.mention}.",
+        ephemeral=True
+    )
+
 
 
 # =========================
@@ -1057,28 +1338,17 @@ async def trivia(interaction: discord.Interaction):
     await interaction.channel.send(reply)
 
 
-@tree.command(name="meme", description="CROBOT fetches a meme for you!")
-async def meme(interaction: discord.Interaction):
-    meme_data = await fetch_random_meme()
-    if not meme_data:
-        await interaction.response.send_message("❌ Failed to fetch meme.")
-        return
-
-    embed = discord.Embed(
-        title=meme_data["title"],
-        url=meme_data["post_link"],
-        color=discord.Color.random()
-    )
-    embed.set_image(url=meme_data["image_url"])
-    embed.set_footer(text=f"From r/{meme_data['subreddit']} by u/{meme_data['author']}")
-
-    await interaction.response.send_message(embed=embed)
-
-
-
-@tree.command(name="playradio", description="Play a radio stream in your current voice channel")
-@app_commands.describe(url="Direct audio stream URL (mp3/aac/opus/m3u8)")
-async def playradio(interaction: discord.Interaction, url: str):
+@tree.command(name="playradio", description="Play a preset radio station in your current voice channel")
+@app_commands.choices(
+    station=[
+        app_commands.Choice(name="Lofi Chill", value="lofi"),
+        app_commands.Choice(name="Chillhop Beats", value="chillhop"),
+        app_commands.Choice(name="Phonk Radio", value="phonk"),
+        app_commands.Choice(name="EDM Hits", value="edm"),
+        app_commands.Choice(name="Synthwave FM", value="synthwave"),
+    ]
+)
+async def playradio(interaction: discord.Interaction, station: app_commands.Choice[str]):
     if not interaction.user.voice or not interaction.user.voice.channel:
         return await interaction.response.send_message(
             "❌ You must be in a voice channel to use this.",
@@ -1087,27 +1357,35 @@ async def playradio(interaction: discord.Interaction, url: str):
 
     channel = interaction.user.voice.channel
 
-    # Connect or move to the user's channel
     vc = interaction.guild.voice_client
     if vc and vc.is_connected():
         await vc.move_to(channel)
     else:
         vc = await channel.connect()
 
+    preset = RADIO_STATIONS.get(station.value)
+    if not preset:
+        return await interaction.response.send_message(
+            "❌ Unknown station. Please pick one of the presets.",
+            ephemeral=True
+        )
+
+    url = preset["url"]
+    name = preset["name"]
+
     try:
-        # NOTE: This requires ffmpeg and voice dependencies to be available in the runtime.
         source = discord.FFmpegOpusAudio(url)
         vc.stop()
         vc.play(source)
         await interaction.response.send_message(
-            f"🎧 Playing radio stream in {channel.mention}.",
+            f"🎧 Playing **{name}** in {channel.mention}.",
             ephemeral=True
         )
-        logger.info(f"Started radio stream in guild {interaction.guild.id}: {url}")
+        logger.info(f"Started radio station '{name}' in guild {interaction.guild.id}: {url}")
     except Exception as e:
         logger.error(f"Failed to play radio: {e}")
         await interaction.response.send_message(
-            "❌ Failed to start radio. Make sure the URL is a valid audio stream and voice dependencies are installed.",
+            "❌ Failed to start radio. Voice dependencies or stream URL may be invalid.",
             ephemeral=True
         )
 
@@ -1173,4 +1451,3 @@ async def love(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     bot.run(DISCORD_BOT_TOKEN)
-
